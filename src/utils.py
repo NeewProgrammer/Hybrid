@@ -49,7 +49,10 @@ def format_timestamp(seconds: float) -> str:
 
 class ConfigManager:
     """
-    配置管理器，用于保存和加载用户设置
+    配置管理器类
+    用于将用户在界面设置的 API Key、选择的模型、源语言等偏好数据，
+    持久化保存到本地文件，以便下次启动时恢复状态。
+    当前存储路径默认位于：`~/.hybrid_subtitle_tool/config.json`
     """
     def __init__(self):
         self._ensure_config_dir()
@@ -62,7 +65,11 @@ class ConfigManager:
                 logger.error(f"无法创建配置目录: {e}")
 
     def load_config(self) -> dict:
-        """加载配置，如果文件不存在则返回空字典（含默认值）"""
+        """
+        加载配置文件。
+        @returns 如果文件不存在或解析失败，则返回包含默认 Gemini 提示词的空字典；
+                 否则返回读取到的配置字典，兼顾处理了旧版缺失提示词字段的升级逻辑。
+        """
         if not CONFIG_FILE.exists():
             return {"gemini_system_prompt": DEFAULT_GEMINI_SYSTEM_PROMPT}
 
@@ -87,8 +94,21 @@ class ConfigManager:
 
 def get_xf_sign(app_id: str, api_key: str, api_secret: str, body: bytes) -> dict:
     """
-    生成讯飞机器翻译 API 的鉴权 Header
-    文档参考: https://itrans.xfyun.cn/v2/its
+    生成讯飞机器翻译 API 的鉴权 Header。
+    鉴权过程包含几个关键步骤以确保请求安全：
+    1. 生成基于 GMT 的标准 Date 字符串。
+    2. 对请求 Body 进行 SHA-256 计算并进行 Base64 编码，生成 Digest。
+    3. 构造签名原串（包含 host, date, request-line, digest）。
+    4. 使用 API Secret 作为密钥，对签名原串进行 HMAC-SHA256 加密生成 Signature。
+    5. 最后将各部分组装为 Authorization Header。
+    
+    官方文档参考: https://itrans.xfyun.cn/v2/its
+    
+    @param app_id 讯飞开放平台 AppID
+    @param api_key 对应应用接口的 APIKey
+    @param api_secret 对应应用接口的 APISecret
+    @param body 请求参数体（JSON）的字节数据
+    @returns 返回带有完整鉴权信息的 Http Headers 字典
     """
     url = "https://itrans.xfyun.cn/v2/its"
     parsed_url = urlparse(url)

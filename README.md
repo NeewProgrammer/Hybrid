@@ -1,43 +1,94 @@
 # Windows 桌面端智能视频字幕生成工具 (Hybrid版)
 
-本项目是一个运行于 Windows 平台的桌面应用程序，用于将外语（英语、日语）视频自动转换为中英/中日双语字幕文件（.srt）。
+本项目是一个运行于 Windows 平台的桌面应用程序，旨在将外语视频（英语、日语等）全自动转换为带时间轴的高精度中英/中日双语字幕文件（`.srt`）。
 
-## 核心功能
+本工具之所以称为 **Hybrid**，是因为它结合了 **本地高性能离线模型** 与 **云端先进大模型 API** 的双重优势：
+- 离线处理隐私数据（提取音频、语音切分、语音识别）
+- 云端处理需要强大推理能力的自然语言任务（上下文翻译）
 
-*   **本地语音识别 (ASR)**: 使用 SenseVoiceSmall 模型进行离线语音识别。
-*   **云端机器翻译 (MT)**: 使用讯飞机器翻译 API 进行翻译。
-*   **双语字幕生成**: 生成标准 SRT 格式的时间轴精准字幕。
+---
 
-## 环境要求
+## 🏗 核心架构与处理流程
 
-1.  **Python 3.8+**
-2.  **FFmpeg**: 必须安装 FFmpeg 并将其添加到系统 PATH 中。
-    *   验证方法: 在终端运行 `ffmpeg -version`。
-3.  **依赖库**: 运行 `pip install -r requirements.txt` 安装所需 Python 库。
+完整的字幕生成流水线如下：
 
-## 安装与运行
+1. **音频提取 (FFmpeg)**：将视频中的音频提取为 `16kHz, 16bit 单声道 WAV` 格式。
+2. **语音活动检测 (FSMN-VAD)**：本地离线模型。精准切分音频中的有效人声片段，剔除长时间静音，以此作为时间轴的基础边界。
+3. **语音识别 (SenseVoiceSmall)**：本地离线模型（基于阿里开源技术）。对 VAD 切分出的每一小段语音进行高精度文字转写与时间戳对齐，支持富文本标签的解析与长短句智能合并拆分。
+4. **机器翻译 (Gemini / 讯飞)**：**核心优化点**。将长列表的原始字幕文本发送至云端翻译。
+   - **Gemini (推荐)**: 采用多线程并发 + **流式请求 (`stream=True`)** + 小批量 (`BATCH_SIZE=8`) 的机制。流式请求是为了保持 HTTP 长连接活跃，彻底解决因服务端生成过慢导致的客户端 `499` 超时断开问题；并发和小批量能够极大提升翻译速度并降低 `504` 网关超时概率。此外，支持自定义 `System Prompt` 确保翻译符合电影字幕的人味与语境。
+   - **讯飞机器翻译**: 备用传统翻译引擎，逐句同步翻译。
+5. **SRT 生成**: 将原始文本、翻译文本和精准时间戳合并为标准的 `.srt` 挂载字幕。
 
-1.  克隆或下载本项目。
-2.  安装依赖:
-    ```bash
-    pip install -r requirements.txt
-    ```
-### 2. 生成 EXE 可执行文件
-为了方便分发和使用，您可以将项目打包为独立的 .exe 文件：
+---
 
-1.  **双击运行 `install_env.bat`**  
-    (确保已安装 PyInstaller 打包工具)
-2.  **双击运行 `build_exe.bat`**  
-    (从命令行构建，自动处理隐藏依赖)
+## 🛠 环境要求与安装
 
-构建完成后，可执行文件位于 `dist\HybridSubtitleTool\HybridSubtitleTool.exe`。
-您可以将整个 `HybridSubtitleTool` 文件夹复制到其他电脑上运行（需确保目标电脑已安装 FFmpeg）。
+### 1. 系统要求
+* 操作系统: Windows 10/11
+* Python 版本: `Python 3.10+` (推荐)
+* **FFmpeg**: 必须将其添加到系统环境变量 `PATH` 中。（在终端执行 `ffmpeg -version` 必须能成功输出）。
 
-## 手动运行开发版
-1. 安装依赖: `pip install -r requirements.txt`
-2. 运行: `python src/main.py`
+### 2. 依赖安装
+克隆项目后，在根目录执行：
+```bash
+pip install -r requirements.txt
+```
 
-## 注意事项
+> **注意：** 首次运行会自动从 ModelScope 下载 VAD 和 ASR 模型（约 1~2 GB），请保持网络畅通。之后运行将在本地缓存（通常位于 `~/.cache/modelscope`）。
 
-*   首次运行会自动从 ModelScope 下载 ASR 模型，请保持网络连接。
-*   需要自行申请讯飞开放平台的机器翻译 API 权限 (AppID, APISecret, APIKey)。
+---
+
+## 🚀 运行与打包
+
+### 开发模式运行
+```bash
+python src/main.py
+```
+
+### 打包为免安装 EXE 绿色版
+为了方便分发和在没有 Python 环境的电脑上使用，您可以将项目打包为独立的 `.exe`：
+1. 双击运行 `build_exe.bat` （如果有此脚本）或使用 PyInstaller：
+   ```bash
+   pyinstaller HybridSubtitleTool.spec
+   ```
+2. 构建完成后，程序位于 `dist/HybridSubtitleTool/` 文件夹内。
+> 分发给他人时，**必须确保目标电脑也配置了 FFmpeg**，否则在提取音频阶段会报错。
+
+---
+
+## ⚙️ 配置说明 (API Settings)
+
+在软件界面点击 **"⚙️ API 设置"**：
+
+### Gemini 配置 (默认首选)
+* **API Key**: 必填。从 Google AI Studio 获取。免费 Key 有 RPM (每分钟请求数) 限制。
+* **模型**: 默认 `gemini-1.5-flash`，速度与性价比最佳。
+* **System Prompt**:（重要！）在此可以自定义给 AI 的角色设定。默认内置了专业的影视字幕翻译提示词，你可以在界面中直接修改为中文要求或添加特定的专有名词词表。
+
+### 讯飞机器翻译配置 (后备)
+* 需在讯飞开放平台申请 "机器翻译" 服务，填入对应的 `AppID`, `API Key`, `API Secret`。
+
+*(所有配置会自动持久化保存至 `C:\Users\用户名\.hybrid_subtitle_tool\config.json`)*
+
+---
+
+## ❓ 常见问题与后续维护指南
+
+### 1. Gemini 翻译时遇到大量 499 (Client Closed Request) 或 504 (Timeout)？
+- **原因**: 以前的版本由于采用了整段等待式请求，在处理日文等复杂文本时，Gemini 响应超过 45 秒，导致 Python requests 客户端认为超时主动断开（499），或服务器网关断开（504）。
+- **已修复**: 当前代码已在 `src/core_worker.py` 的 `translate_batch_gemini` 中引入了 `stream=True` 流式请求。
+- **如何进一步调优**:
+  打开 `src/core_worker.py`，找到 `translate_batch_gemini` 顶部的可调参数区：
+  - 如果你是免费 Key (速率受限)，请将 `MAX_WORKERS` 降至 `2` 甚至 `1`，避免触发 HTTP 429。
+  - 如果依然偶发 504，可尝试将 `BATCH_SIZE` 从 `8` 降至 `5`。
+
+### 2. CUDA Out of Memory (显存溢出)
+- 工具默认优先使用 `cuda` (GPU)。如果不幸 OOM，可能是由于音频时长过长或显存不足。SenseVoice 和 VAD 占用不算极大，若报错，请关闭其他占用显存的程序。
+
+### 3. 字幕时间轴太碎或太长？
+- 解析 SenseVoice 富文本的逻辑在 `core_worker.py -> parse_asr_result`。
+- 如果觉得断句不够自然，可以修改该方法中的**合并条件**（默认小于 1.5 秒且字数短的会和下一句合并）以及**切割条件**（默认超 80 字符被分割）。
+
+### 4. 日志不打印或看不见？
+- 所有的运行日志不仅会在界面的只读文本框显示，底层也使用了标准 `logging` 模块。如果需要在终端查看详细的 debug 信息，可在 `src/utils.py` 中将日志级别从 `INFO` 改为 `DEBUG`。

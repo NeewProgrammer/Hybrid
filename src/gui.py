@@ -12,6 +12,11 @@ from utils import ConfigManager
 from core_worker import SubtitleWorker
 
 class DragDropWidget(QLabel):
+    """
+    自定义的拖拽上传控件组件。
+    继承自 QLabel，支持通过鼠标点击选择视频文件，
+    也支持直接将文件拖拽进入由于虚线包裹的上传区域。
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
@@ -67,6 +72,12 @@ class DragDropWidget(QLabel):
         # 通知父级或其他组件（如果有需要）
 
 class SettingsDialog(QDialog):
+    """
+    API 偏好设置对话框。
+    在此界面配置选择的翻译服务商（Provider: Gemini / 讯飞），
+    以及对应的鉴权密钥、翻译模型和 System Prompt。
+    提供获取 Gemini 可用模型的在线查询功能。
+    """
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("API 设置")
@@ -179,6 +190,11 @@ class SettingsDialog(QDialog):
         }
 
 class MainWindow(QMainWindow):
+    """
+    应用程序主窗口（Main Window）。
+    承载拖拽上传组件、设置按钮、任务控制（开始/取消）、进度条和状态日志输出。
+    负责初始化配置加载，并将 UI 的操作绑定到后端的 SubtitleWorker 独立工作线程。
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("智能视频字幕生成工具 (Hybrid)")

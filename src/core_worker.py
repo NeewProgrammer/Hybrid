@@ -35,10 +35,20 @@ class WorkerSignals(QObject):
     log = Signal(str)
 
 class SubtitleWorker(QThread):
+    """
+    负责字幕生成核心流水的后台线程类。
+    完整流水线：
+    1. FFmpeg 提取音频（WAV）
+    2. VAD（语音活动检测）剔除静音
+    3. SenseVoice（语音识别）生成带时间戳的富文本
+    4. 翻译引擎（Gemini 或 讯飞）处理识别文本
+    5. 生成最终的双语 SRT 字幕文件
+    """
     def __init__(self, video_path, config):
         """
-        :param video_path: 视频文件路径
-        :param config: 字典配置，包含 app_id, api_key, api_secret, target_lang 等
+        初始化工作线程
+        @param video_path 视频文件的绝对路径
+        @param config 字典配置，包含 app_id, api_key, api_secret, provider, gemini_api_key 等
         """
         super().__init__()
         self.video_path = video_path
@@ -571,18 +581,23 @@ class SubtitleWorker(QThread):
 
     def translate_batch_gemini(self, texts: list) -> list:
         """
-        将字幕并发分批发送给 Gemini 翻译。
-        使用线程池并发处理多个小批次，大幅提升翻译速度。
-        采用流式请求（stream=True）保持长连接，避免客户端 499 超时断开。
+        将字幕并发分批发送给 Gemini 翻译（核心网络请求组件）。
+        采用以下策略保障稳定性和效率：
+        1. 线程池并发处理多个小批次（Batching + Concurrency），极大提升吞吐量。
+        2. 采用流式请求（stream=True）维持长连接。防止 Gemini 生成耗时较长时，发起端 requests/urllib3 因为 timeout=120 提前强行终止（即 499 Client Closed Request 错误）。
+        3. 指数退避重试（Exponential Backoff），应对临时性的 503 或 429 错误。
+
+        @param texts 待翻译的原文列表
+        @returns 翻译完成的中文字符串列表，顺序与 `texts` 严格一致
         """
         import google.generativeai as genai
 
-        # ── 可调参数 ──────────────────────────────────────────
-        BATCH_SIZE = 8           # 每批条数：缩小批量 → 每批响应更快 → 减少 504
-        MAX_WORKERS = 4          # 并发线程数：适当降低 → 单批更稳定（免费 Key 建议改为 2）
-        TIMEOUT_SECONDS = 120    # 流式超时：放大到 120s，防止 499 客户端提前断开
+        # ── 可调参数（根据 API 额度和网络状况进行微调） ─────────────────────
+        BATCH_SIZE = 8           # 每批条数：减小单批任务量，能有效降低服务端生成超时的 504 错误
+        MAX_WORKERS = 4          # 并发线程数：降低并发以换取单次连接的稳定性（免费 API Key 建议设为 1 或 2，防止 429 Too Many Requests）
+        TIMEOUT_SECONDS = 120    # 流式超时时间（秒）：放大至 120s。因为设定了流式，所以只要服务端在吐字，连接就不会轻易断
         MAX_RETRIES = 3          # 最大重试次数
-        # ────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
 
         api_key = self.config.get('gemini_api_key')
         if not api_key:
@@ -630,7 +645,10 @@ class SubtitleWorker(QThread):
 
         def _translate_single_batch(batch_num, batch_texts, batch_indices):
             """
-            翻译单个批次，带重试和详细日志。在线程池中被并发调用。
+            内部函数：在独立线程中执行单批次的翻译任务。
+            @param batch_num 批次序号（用于日志显示）
+            @param batch_texts 当前批次需要翻译的原始文本列表
+            @param batch_indices 该批次文本在整体 `texts` 数组中的原始索引，用于最终结果的回填对齐
             """
             thread_name = threading.current_thread().name
             tag = f"[批次 {batch_num}/{total_batches}][{thread_name}]"
@@ -682,20 +700,22 @@ class SubtitleWorker(QThread):
                     elapsed = time.time() - t_start
                     raw = "".join(raw_chunks).strip()
 
-                    # 去掉可能的 markdown 代码块包裹
+                    # HACK: 剥离可能由大模型返回的 markdown JSON 代码块包裹 (```json ... ```)
+                    # 虽然我们在 prompt 中要求了“ONLY a JSON array”，但大模型偶尔仍会附带 markdown
                     if raw.startswith("```"):
                         raw = re.sub(r'^```[a-z]*\n?', '', raw)
                         raw = re.sub(r'\n?```$', '', raw)
 
                     translations = json.loads(raw)
 
+                    # 强校验：确保返回的数组长度与发送的原文段落数严格对齐
                     if not isinstance(translations, list) or len(translations) != len(batch_texts):
                         raise ValueError(
                             f"返回数量不符: 期望 {len(batch_texts)} 条，"
                             f"实际收到 {len(translations) if isinstance(translations, list) else 'non-list'}"
                         )
 
-                    # 回填结果
+                    # 将当前批次的翻译结果，回填到总的结果数组中的对应位置
                     for idx, translated in zip(batch_indices, translations):
                         results[idx] = str(translated)
 
