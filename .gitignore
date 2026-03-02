@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.env
+.venv
+venv/
+env/
+
+# PyInstaller 打包输出（体积大，不需要上传）
+build/
+dist/
+*.spec
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# 本地配置（可能包含 API Key 等敏感信息）
+config.json
+*.local.json

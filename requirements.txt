@@ -1,0 +1,9 @@
+pyside6
+modelscope
+funasr
+torch
+torchaudio
+requests
+ffmpeg-python
+pycryptodome
+google-generativeai
