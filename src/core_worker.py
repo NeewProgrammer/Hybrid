@@ -573,13 +573,14 @@ class SubtitleWorker(QThread):
         """
         将字幕并发分批发送给 Gemini 翻译。
         使用线程池并发处理多个小批次，大幅提升翻译速度。
+        采用流式请求（stream=True）保持长连接，避免客户端 499 超时断开。
         """
         import google.generativeai as genai
 
         # ── 可调参数 ──────────────────────────────────────────
-        BATCH_SIZE = 15          # 每批条数（小批量降低超时风险）
-        MAX_WORKERS = 6          # 并发线程数（免费 Key 建议改为 2）
-        TIMEOUT_SECONDS = 45     # 单次请求超时
+        BATCH_SIZE = 8           # 每批条数：缩小批量 → 每批响应更快 → 减少 504
+        MAX_WORKERS = 4          # 并发线程数：适当降低 → 单批更稳定（免费 Key 建议改为 2）
+        TIMEOUT_SECONDS = 120    # 流式超时：放大到 120s，防止 499 客户端提前断开
         MAX_RETRIES = 3          # 最大重试次数
         # ────────────────────────────────────────────────────
 
@@ -656,18 +657,32 @@ class SubtitleWorker(QThread):
 
                 try:
                     self.signals.log.emit(
-                        f"{tag} 🔄 第 {attempt}/{MAX_RETRIES} 次请求 (超时 {TIMEOUT_SECONDS}s)..."
+                        f"{tag} 🔄 第 {attempt}/{MAX_RETRIES} 次请求 (流式模式, 超时 {TIMEOUT_SECONDS}s)..."
                     )
                     t_start = time.time()
+                    elapsed = 0
 
-                    response = model.generate_content(
+                    # NOTE: 使用 stream=True 保持 HTTP 长连接，防止服务端慢响应时
+                    # 客户端提前超时断开（即 499 错误）
+                    response_stream = model.generate_content(
                         prompt,
+                        stream=True,
                         request_options={"timeout": TIMEOUT_SECONDS}
                     )
 
-                    elapsed = time.time() - t_start
+                    # 逐块拼接，持续保持连接活跃
+                    raw_chunks = []
+                    for chunk in response_stream:
+                        if self._is_cancelled:
+                            self.signals.log.emit(f"{tag} ⏭ 流式传输中断（任务取消）")
+                            return
+                        if chunk.text:
+                            raw_chunks.append(chunk.text)
 
-                    raw = response.text.strip()
+                    elapsed = time.time() - t_start
+                    raw = "".join(raw_chunks).strip()
+
+                    # 去掉可能的 markdown 代码块包裹
                     if raw.startswith("```"):
                         raw = re.sub(r'^```[a-z]*\n?', '', raw)
                         raw = re.sub(r'\n?```$', '', raw)
