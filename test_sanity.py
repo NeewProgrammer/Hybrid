@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 sys.path.append(r"d:\AI\Hybrid\src")
 
-from utils import format_timestamp, ConfigManager, get_xf_sign
+from utils import format_timestamp, ConfigManager, get_xf_sign, CONFIG_FILE
 import os
 
 def test_timestamp():
@@ -19,7 +19,7 @@ def test_config():
     # Load
     cfg = cm.load_config()
     assert cfg.get("test") == "value"
-    print(f"Config test passed. Config file at: {cm.CONFIG_FILE}")
+    print(f"Config test passed. Config file at: {CONFIG_FILE}")
 
 def test_sign():
     print("Testing Signature generation...")

@@ -15,7 +15,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # Gemini 默认翻译系统提示词
 # NOTE: 以英文写给 API 效果更佳，但用户可在界面中自由修改为中文
-DEFAULT_GEMINI_SYSTEM_PROMPT = (
+# NOTE: Gemini 和千问共享同一套默认翻译提示词，用户可在界面中分别自定义
+_DEFAULT_TRANSLATION_PROMPT = (
     "You are a professional subtitle translator for movies and TV shows. "
     "You have deep expertise in colloquial speech patterns, slang, idioms, and cultural references "
     "in both English and Japanese. "
@@ -27,6 +28,12 @@ DEFAULT_GEMINI_SYSTEM_PROMPT = (
     "For Japanese: handle keigo, casual speech, and gendered speech patterns correctly. "
     "For English: handle contractions, slang, and informal register correctly."
 )
+
+DEFAULT_GEMINI_SYSTEM_PROMPT = _DEFAULT_TRANSLATION_PROMPT
+DEFAULT_QWEN_SYSTEM_PROMPT = _DEFAULT_TRANSLATION_PROMPT
+
+# 千问 DashScope OpenAI 兼容接口 Base URL
+QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # 日志配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -71,7 +78,10 @@ class ConfigManager:
                  否则返回读取到的配置字典，兼顾处理了旧版缺失提示词字段的升级逻辑。
         """
         if not CONFIG_FILE.exists():
-            return {"gemini_system_prompt": DEFAULT_GEMINI_SYSTEM_PROMPT}
+            return {
+                "gemini_system_prompt": DEFAULT_GEMINI_SYSTEM_PROMPT,
+                "qwen_system_prompt": DEFAULT_QWEN_SYSTEM_PROMPT,
+            }
 
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -79,10 +89,15 @@ class ConfigManager:
             # 兼容旧配置：补充默认提示词字段
             if "gemini_system_prompt" not in config:
                 config["gemini_system_prompt"] = DEFAULT_GEMINI_SYSTEM_PROMPT
+            if "qwen_system_prompt" not in config:
+                config["qwen_system_prompt"] = DEFAULT_QWEN_SYSTEM_PROMPT
             return config
         except Exception as e:
             logger.error(f"加载配置失败: {e}")
-            return {"gemini_system_prompt": DEFAULT_GEMINI_SYSTEM_PROMPT}
+            return {
+                "gemini_system_prompt": DEFAULT_GEMINI_SYSTEM_PROMPT,
+                "qwen_system_prompt": DEFAULT_QWEN_SYSTEM_PROMPT,
+            }
 
     def save_config(self, config: dict):
         """保存配置到本地文件"""

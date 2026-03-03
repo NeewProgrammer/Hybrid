@@ -234,6 +234,17 @@ class SubtitleWorker(QThread):
                         "original": self.clean_text(seg['text']),
                         "translated": translated_text
                     })
+            elif provider == 'qwen':
+                self.signals.progress.emit("正在批量翻译 (千问)...", 45)
+                texts = [self.clean_text(seg['text']) for seg in raw_segments]
+                translations = self.translate_batch_qwen(texts)
+                for seg, translated_text in zip(raw_segments, translations):
+                    translated_segments.append({
+                        "start": seg['start'],
+                        "end": seg['end'],
+                        "original": self.clean_text(seg['text']),
+                        "translated": translated_text
+                    })
             else:
                 for i, seg in enumerate(raw_segments):
                     if self._is_cancelled: return
@@ -578,6 +589,233 @@ class SubtitleWorker(QThread):
         except Exception as e:
             logger.error(f"Parse Error: {e}")
             raise RuntimeError(f"Translation Parse Error: {e}")
+
+    def translate_batch_qwen(self, texts: list) -> list:
+        """
+        将字幕并发分批发送给千问翻译。
+        使用 OpenAI 兼容接口调用 DashScope API，采用与 Gemini 类似的策略：
+        1. 线程池并发处理多个小批次
+        2. 指数退避重试（Exponential Backoff）
+        3. JSON 数组格式返回
+
+        @param texts 待翻译的原文列表
+        @returns 翻译完成的中文字符串列表，顺序与 texts 严格一致
+        """
+        from openai import OpenAI
+        from utils import QWEN_BASE_URL
+
+        # ── 可调参数 ────────────────────────────────────────────
+        BATCH_SIZE = 8
+        MAX_WORKERS = 4
+        TIMEOUT_SECONDS = 120
+        MAX_RETRIES = 3
+        # ────────────────────────────────────────────────────────
+
+        api_key = self.config.get('qwen_api_key')
+        if not api_key:
+            self.signals.log.emit("⚠ 千问 API Key 未配置")
+            return ["[配置缺失]"] * len(texts)
+
+        src_lang_map = {'英语': 'English', '日语': 'Japanese', '自动': 'the source language'}
+        src = src_lang_map.get(self.config.get('source_lang', '自动'), 'the source language')
+
+        # 过滤空文本，记录原始索引以便回填
+        indexed = [(i, t) for i, t in enumerate(texts) if t.strip()]
+        results = [""] * len(texts)
+        if not indexed:
+            return results
+
+        indices, non_empty = zip(*indexed)
+        non_empty = list(non_empty)
+        indices = list(indices)
+
+        # 优先使用用户自定义提示词
+        system_instruction = self.config.get("qwen_system_prompt", "").strip()
+        if not system_instruction:
+            from utils import DEFAULT_QWEN_SYSTEM_PROMPT
+            system_instruction = DEFAULT_QWEN_SYSTEM_PROMPT
+
+        client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
+        model_name = self.config.get('qwen_model', 'qwen-plus')
+
+        total = len(non_empty)
+        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+        self.signals.log.emit(
+            f"═══ 千问翻译启动 ═══\n"
+            f"  模型: {model_name}\n"
+            f"  总句数: {total} | 每批: {BATCH_SIZE} 句 | 共 {total_batches} 批\n"
+            f"  并发线程: {MAX_WORKERS} | 超时: {TIMEOUT_SECONDS}s | 最大重试: {MAX_RETRIES} 次"
+        )
+
+        # 线程安全的进度计数器
+        completed_lock = threading.Lock()
+        completed_count = [0]
+        failed_batches = []
+
+        def _translate_single_batch(batch_num, batch_texts, batch_indices):
+            """
+            内部函数：在独立线程中执行单批次的千问翻译任务。
+            @param batch_num 批次序号
+            @param batch_texts 当前批次的原始文本列表
+            @param batch_indices 原始索引列表
+            """
+            thread_name = threading.current_thread().name
+            tag = f"[批次 {batch_num}/{total_batches}][{thread_name}]"
+
+            if self._is_cancelled:
+                self.signals.log.emit(f"{tag} ⏭ 任务已取消，跳过")
+                return
+
+            self.signals.log.emit(
+                f"{tag} 📤 开始翻译 ({len(batch_texts)} 句)..."
+            )
+
+            prompt = (
+                f"Translate these {src} subtitles to Simplified Chinese.\n"
+                f"Return ONLY a JSON array of exactly {len(batch_texts)} translated strings, "
+                f"same order, no extra text.\n"
+                f"{json.dumps(batch_texts, ensure_ascii=False)}"
+            )
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                if self._is_cancelled:
+                    self.signals.log.emit(f"{tag} ⏭ 任务已取消，停止重试")
+                    return
+
+                try:
+                    self.signals.log.emit(
+                        f"{tag} 🔄 第 {attempt}/{MAX_RETRIES} 次请求 (超时 {TIMEOUT_SECONDS}s)..."
+                    )
+                    t_start = time.time()
+
+                    # NOTE: 使用 stream=True 保持长连接，防止慢响应时超时
+                    response_stream = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": prompt}
+                        ],
+                        stream=True,
+                        timeout=TIMEOUT_SECONDS
+                    )
+
+                    # 逐块拼接流式输出
+                    raw_chunks = []
+                    for chunk in response_stream:
+                        if self._is_cancelled:
+                            self.signals.log.emit(f"{tag} ⏭ 流式传输中断（任务取消）")
+                            return
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            raw_chunks.append(chunk.choices[0].delta.content)
+
+                    elapsed = time.time() - t_start
+                    raw = "".join(raw_chunks).strip()
+
+                    # HACK: 剥离可能的 markdown JSON 代码块包裹
+                    if raw.startswith("```"):
+                        raw = re.sub(r'^```[a-z]*\n?', '', raw)
+                        raw = re.sub(r'\n?```$', '', raw)
+
+                    translations = json.loads(raw)
+
+                    # 强校验：确保返回数组长度与原文段落数严格一致
+                    if not isinstance(translations, list) or len(translations) != len(batch_texts):
+                        raise ValueError(
+                            f"返回数量不符: 期望 {len(batch_texts)} 条，"
+                            f"实际收到 {len(translations) if isinstance(translations, list) else 'non-list'}"
+                        )
+
+                    # 回填结果到对应位置
+                    for idx, translated in zip(batch_indices, translations):
+                        results[idx] = str(translated)
+
+                    # 更新进度
+                    with completed_lock:
+                        completed_count[0] += 1
+                        done = completed_count[0]
+                    progress = 45 + int((done / total_batches) * 45)
+                    self.signals.progress.emit(
+                        f"翻译中 ({done}/{total_batches} 批完成)...", progress
+                    )
+
+                    self.signals.log.emit(
+                        f"{tag} ✅ 成功 — {len(batch_texts)} 句已翻译 "
+                        f"(耗时 {elapsed:.1f}s, 进度 {done}/{total_batches})"
+                    )
+                    return  # 成功，退出重试循环
+
+                except Exception as e:
+                    elapsed = time.time() - t_start if 't_start' in dir() else 0
+                    error_type = type(e).__name__
+
+                    logger.error(f"千问批次 {batch_num} 第 {attempt} 次失败: {e}")
+
+                    if attempt < MAX_RETRIES:
+                        wait_sec = 2 ** attempt
+                        self.signals.log.emit(
+                            f"{tag} ❌ 第 {attempt} 次失败 [{error_type}]: {e}\n"
+                            f"{tag} ⏳ 等待 {wait_sec}s 后重试..."
+                        )
+                        time.sleep(wait_sec)
+                    else:
+                        self.signals.log.emit(
+                            f"{tag} ❌ 第 {attempt} 次失败 [{error_type}]: {e}\n"
+                            f"{tag} 🚫 已达最大重试次数，标记为翻译失败"
+                        )
+                        for idx in batch_indices:
+                            results[idx] = "[翻译失败]"
+
+                        with completed_lock:
+                            completed_count[0] += 1
+                            failed_batches.append(batch_num)
+
+        # ── 构建所有批次任务 ──────────────────────────────────
+        batch_tasks = []
+        for batch_start in range(0, total, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            batch_num = batch_start // BATCH_SIZE + 1
+            batch_texts = non_empty[batch_start:batch_end]
+            batch_indices_slice = indices[batch_start:batch_end]
+            batch_tasks.append((batch_num, batch_texts, batch_indices_slice))
+
+        # ── 并发执行 ─────────────────────────────────────────
+        self.signals.log.emit(f"───────────────────────────────────")
+        self.signals.log.emit(f"🚀 启动 {MAX_WORKERS} 个并发线程处理 {len(batch_tasks)} 个批次 (千问)...")
+        self.signals.log.emit(f"───────────────────────────────────")
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_WORKERS,
+            thread_name_prefix="QwenWorker"
+        ) as executor:
+            futures = {
+                executor.submit(_translate_single_batch, num, texts_batch, idx_batch): num
+                for num, texts_batch, idx_batch in batch_tasks
+            }
+
+            for future in concurrent.futures.as_completed(futures):
+                batch_num = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"线程异常 (千问批次 {batch_num}): {e}")
+                    self.signals.log.emit(f"⚠ 千问批次 {batch_num} 线程异常: {e}")
+
+        # ── 汇总 ─────────────────────────────────────────────
+        success_count = total_batches - len(failed_batches)
+        self.signals.log.emit(f"───────────────────────────────────")
+        if failed_batches:
+            self.signals.log.emit(
+                f"⚠ 千问翻译完成: {success_count}/{total_batches} 批成功，"
+                f"{len(failed_batches)} 批失败 (批次号: {failed_batches})"
+            )
+        else:
+            self.signals.log.emit(
+                f"✅ 千问翻译全部完成！{total_batches}/{total_batches} 批均成功"
+            )
+        self.signals.log.emit(f"───────────────────────────────────")
+
+        return results
 
     def translate_batch_gemini(self, texts: list) -> list:
         """

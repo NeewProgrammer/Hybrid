@@ -7,3 +7,4 @@ requests
 ffmpeg-python
 pycryptodome
 google-generativeai
+openai

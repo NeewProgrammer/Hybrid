@@ -1,5 +1,6 @@
 ﻿import sys
 import os
+import logging
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit, 
@@ -10,6 +11,90 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 
 from utils import ConfigManager
 from core_worker import SubtitleWorker
+
+logger = logging.getLogger(__name__)
+
+# ── 模型推荐判定规则（三级：⭐最佳 / ✅可用 / ❌不推荐） ────────
+# NOTE: 当前使用场景为「字幕翻译」，推荐依据：
+#   - 最佳推荐：经过验证的、速度快且翻译质量高的主力文本模型
+#   - 可用：通用文本模型，能翻译但非最优选择
+#   - 不推荐：非文本任务模型（embedding/音频/图像/视频/代码等）
+
+# Gemini：最佳翻译模型白名单（关键词匹配，命中任一即为最佳）
+# NOTE: flash 系列速度快且免费额度高，pro 系列质量更高但较慢
+_GEMINI_BEST_KEYWORDS = [
+    "gemini-2.5-flash", "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash", "gemini-1.5-pro",
+]
+
+# Gemini：明确不适合翻译的模型（关键词匹配，命中即为不推荐）
+_GEMINI_EXCLUDE_KEYWORDS = [
+    "embedding", "aqa", "imagen", "veo", "bisheng",
+    "learnlm", "codestral", "exp",
+]
+
+# 千问：最佳翻译模型白名单
+# NOTE: plus 性价比最高，max 质量最好，turbo 速度最快
+_QWEN_BEST_KEYWORDS = [
+    "qwen-plus", "qwen-max", "qwen-turbo", "qwen-long",
+    "qwen3-235b", "qwen3-32b", "qwen3-30b",
+]
+
+# 千问：明确不适合翻译的模型
+_QWEN_EXCLUDE_KEYWORDS = [
+    "embedding", "audio", "-vl", "image", "ocr", "math",
+    "coder", "code", "rerank", "paraformer", "sambert",
+    "wordart", "cosyvoice", "farui", "marco",
+]
+
+
+def _rate_gemini_model(model_name: str) -> str:
+    """
+    对 Gemini 模型进行翻译场景的三级评分。
+    @returns 'best' | 'ok' | 'bad'
+    """
+    name_lower = model_name.lower()
+    # 先检查黑名单
+    for kw in _GEMINI_EXCLUDE_KEYWORDS:
+        if kw in name_lower:
+            return "bad"
+    # 再检查最佳白名单
+    for kw in _GEMINI_BEST_KEYWORDS:
+        if name_lower.startswith(kw):
+            return "best"
+    # 其余为可用但非最佳
+    return "ok"
+
+
+def _rate_qwen_model(model_name: str) -> str:
+    """
+    对千问模型进行翻译场景的三级评分。
+    @returns 'best' | 'ok' | 'bad'
+    """
+    name_lower = model_name.lower()
+    # 先检查黑名单
+    for kw in _QWEN_EXCLUDE_KEYWORDS:
+        if kw in name_lower:
+            return "bad"
+    # 再检查最佳白名单
+    for kw in _QWEN_BEST_KEYWORDS:
+        if name_lower.startswith(kw):
+            return "best"
+    # 其余为可用但非最佳
+    return "ok"
+
+
+# 评分到显示标签的映射
+_RATING_LABELS = {
+    "best": "⭐最佳推荐",
+    "ok": "✅可用",
+    "bad": "❌不推荐",
+}
+
+# 评分排序权重（数字越小排越前）
+_RATING_ORDER = {"best": 0, "ok": 1, "bad": 2}
+
 
 class DragDropWidget(QLabel):
     """
@@ -74,14 +159,14 @@ class DragDropWidget(QLabel):
 class SettingsDialog(QDialog):
     """
     API 偏好设置对话框。
-    在此界面配置选择的翻译服务商（Provider: Gemini / 讯飞），
+    在此界面配置选择的翻译服务商（Provider: Gemini / 千问 / 讯飞），
     以及对应的鉴权密钥、翻译模型和 System Prompt。
-    提供获取 Gemini 可用模型的在线查询功能。
+    提供获取 Gemini / 千问可用模型的在线查询功能，并标注推荐/不推荐。
     """
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("API 设置")
-        self.resize(480, 520)
+        self.resize(520, 600)
         self.config = config
         self.setup_ui()
 
@@ -91,14 +176,17 @@ class SettingsDialog(QDialog):
         # Provider selector
         top_form = QFormLayout()
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["Gemini", "讯飞"])
+        self.provider_combo.addItems(["Gemini", "千问", "讯飞"])
+        # 映射 provider 内部值到显示文本
+        provider_display_map = {"gemini": "Gemini", "qwen": "千问", "xunfei": "讯飞"}
+        saved_provider = self.config.get("provider", "gemini")
         self.provider_combo.setCurrentText(
-            "Gemini" if self.config.get("provider", "gemini") == "gemini" else "讯飞"
+            provider_display_map.get(saved_provider, "Gemini")
         )
         top_form.addRow("翻译提供商:", self.provider_combo)
         layout.addLayout(top_form)
 
-        # Gemini group
+        # ── Gemini 设置组 ──────────────────────────────────────
         self.gemini_group = QGroupBox("Gemini 设置")
         gemini_form = QFormLayout(self.gemini_group)
         self.gemini_key_edit = QLineEdit(self.config.get("gemini_api_key", ""))
@@ -126,7 +214,34 @@ class SettingsDialog(QDialog):
         gemini_form.addRow("翻译提示词:\n(System Prompt)", self.prompt_edit)
         layout.addWidget(self.gemini_group)
 
-        # Xunfei group
+        # ── 千问设置组 ──────────────────────────────────────────
+        self.qwen_group = QGroupBox("千问 设置")
+        qwen_form = QFormLayout(self.qwen_group)
+        self.qwen_key_edit = QLineEdit(self.config.get("qwen_api_key", ""))
+        self.qwen_key_edit.setEchoMode(QLineEdit.Password)
+        self.qwen_key_edit.setPlaceholderText("sk-...")
+        qwen_form.addRow("API Key:", self.qwen_key_edit)
+
+        qwen_model_row = QHBoxLayout()
+        self.qwen_model_combo = QComboBox()
+        saved_qwen_model = self.config.get("qwen_model", "qwen-plus")
+        self.qwen_model_combo.addItem(saved_qwen_model)
+        self.qwen_model_combo.setCurrentText(saved_qwen_model)
+        self.fetch_qwen_models_btn = QPushButton("获取模型列表")
+        self.fetch_qwen_models_btn.clicked.connect(self._fetch_qwen_models)
+        qwen_model_row.addWidget(self.qwen_model_combo, 1)
+        qwen_model_row.addWidget(self.fetch_qwen_models_btn)
+        qwen_form.addRow("模型:", qwen_model_row)
+
+        # 千问翻译提示词编辑框（System Prompt）
+        self.qwen_prompt_edit = QTextEdit()
+        self.qwen_prompt_edit.setPlaceholderText("在此输入发送给千问的翻译指令...")
+        self.qwen_prompt_edit.setPlainText(self.config.get("qwen_system_prompt", ""))
+        self.qwen_prompt_edit.setFixedHeight(140)
+        qwen_form.addRow("翻译提示词:\n(System Prompt)", self.qwen_prompt_edit)
+        layout.addWidget(self.qwen_group)
+
+        # ── 讯飞设置组 ──────────────────────────────────────────
         self.xunfei_group = QGroupBox("讯飞 设置")
         xunfei_form = QFormLayout(self.xunfei_group)
         self.app_id_edit = QLineEdit(self.config.get("app_id", ""))
@@ -156,33 +271,198 @@ class SettingsDialog(QDialog):
         layout.addWidget(button_box)
 
     def _fetch_gemini_models(self):
+        """
+        通过 Gemini API Key 查询可用模型列表。
+        每个模型会根据翻译场景标注「✅推荐」或「❌不推荐」。
+        """
         api_key = self.gemini_key_edit.text().strip()
         if not api_key:
-            QMessageBox.warning(self, "提示", "请先填写 API Key")
+            QMessageBox.warning(self, "提示", "请先填写 Gemini API Key")
             return
+
+        logger.info("[Gemini] 开始查询可用模型列表...")
+        self.fetch_models_btn.setEnabled(False)
+        self.fetch_models_btn.setText("查询中...")
+
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
-            models = [m.name.replace("models/", "") for m in genai.list_models()
-                      if "generateContent" in m.supported_generation_methods]
+            logger.info("[Gemini] 已配置 API Key，正在调用 list_models()...")
+
+            raw_models = [
+                m.name.replace("models/", "") for m in genai.list_models()
+                if "generateContent" in m.supported_generation_methods
+            ]
+
+            logger.info(f"[Gemini] 查询成功，获取到 {len(raw_models)} 个支持 generateContent 的模型")
+
+            # 三级评分 + 按评分排序（最佳在前，不推荐在后）
+            rated = [(m, _rate_gemini_model(m)) for m in raw_models]
+            rated.sort(key=lambda x: _RATING_ORDER[x[1]])
+
+            # 构建带标注的显示列表
+            display_items = []
+            best_count = ok_count = bad_count = 0
+            for m, rating in rated:
+                label = _RATING_LABELS[rating]
+                display_items.append(f"{m}  {label}")
+                if rating == "best":
+                    best_count += 1
+                elif rating == "ok":
+                    ok_count += 1
+                else:
+                    bad_count += 1
+                logger.info(f"  [Gemini] 模型: {m} -> {label}")
+
             self.model_combo.clear()
-            self.model_combo.addItems(models)
+            self.model_combo.addItems(display_items)
+
+            # 尝试恢复之前保存的模型选择，否则默认选中第一个（已按评分排序，最佳在前）
             saved = self.config.get("gemini_model", "gemini-1.5-flash")
-            if saved in models:
-                self.model_combo.setCurrentText(saved)
+            for i, item in enumerate(display_items):
+                if item.startswith(saved):
+                    self.model_combo.setCurrentIndex(i)
+                    break
+
+            logger.info(
+                f"[Gemini] 模型列表已更新："
+                f"{best_count} 个最佳推荐 / {ok_count} 个可用 / {bad_count} 个不推荐"
+            )
+
         except Exception as e:
-            QMessageBox.critical(self, "获取失败", str(e))
+            error_msg = str(e)
+            logger.error(f"[Gemini] 查询模型列表失败: {error_msg}", exc_info=True)
+
+            # 为用户提供更具体的错误诊断
+            if "API_KEY_INVALID" in error_msg or "401" in error_msg:
+                detail = "API Key 无效或已过期，请检查后重试。"
+            elif "PERMISSION_DENIED" in error_msg or "403" in error_msg:
+                detail = "API Key 权限不足，请确认该 Key 已开通 Generative AI 服务。"
+            elif "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
+                detail = "请求频率超限，请稍后重试。"
+            elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+                detail = "网络连接失败，请检查网络环境（是否需要代理）。"
+            else:
+                detail = error_msg
+
+            QMessageBox.critical(self, "获取 Gemini 模型列表失败", f"错误详情：\n{detail}")
+
+        finally:
+            self.fetch_models_btn.setEnabled(True)
+            self.fetch_models_btn.setText("获取模型列表")
+
+    def _fetch_qwen_models(self):
+        """
+        通过千问 API Key 查询 DashScope 平台可用模型列表。
+        使用 OpenAI 兼容接口的 models.list() 方法。
+        每个模型会根据翻译场景标注「✅推荐」或「❌不推荐」。
+        """
+        api_key = self.qwen_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "提示", "请先填写千问 API Key")
+            return
+
+        logger.info("[千问] 开始查询可用模型列表...")
+        self.fetch_qwen_models_btn.setEnabled(False)
+        self.fetch_qwen_models_btn.setText("查询中...")
+
+        try:
+            from openai import OpenAI
+            from utils import QWEN_BASE_URL
+
+            logger.info(f"[千问] 正在连接 DashScope API (base_url={QWEN_BASE_URL})...")
+            client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
+
+            response = client.models.list()
+            raw_models = sorted([m.id for m in response.data])
+
+            logger.info(f"[千问] 查询成功，获取到 {len(raw_models)} 个可用模型")
+
+            # 三级评分 + 按评分排序
+            rated = [(m, _rate_qwen_model(m)) for m in raw_models]
+            rated.sort(key=lambda x: _RATING_ORDER[x[1]])
+
+            # 构建带标注的显示列表
+            display_items = []
+            best_count = ok_count = bad_count = 0
+            for m, rating in rated:
+                label = _RATING_LABELS[rating]
+                display_items.append(f"{m}  {label}")
+                if rating == "best":
+                    best_count += 1
+                elif rating == "ok":
+                    ok_count += 1
+                else:
+                    bad_count += 1
+                logger.info(f"  [千问] 模型: {m} -> {label}")
+
+            self.qwen_model_combo.clear()
+            self.qwen_model_combo.addItems(display_items)
+
+            # 尝试恢复之前保存的模型选择
+            saved = self.config.get("qwen_model", "qwen-plus")
+            for i, item in enumerate(display_items):
+                if item.startswith(saved):
+                    self.qwen_model_combo.setCurrentIndex(i)
+                    break
+
+            logger.info(
+                f"[千问] 模型列表已更新："
+                f"{best_count} 个最佳推荐 / {ok_count} 个可用 / {bad_count} 个不推荐"
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"[千问] 查询模型列表失败: {error_msg}", exc_info=True)
+
+            # 为用户提供更具体的错误诊断
+            if "Unauthorized" in error_msg or "401" in error_msg:
+                detail = "API Key 无效或已过期，请检查后重试。"
+            elif "Forbidden" in error_msg or "403" in error_msg:
+                detail = "API Key 权限不足，请确认该 Key 已开通模型服务。"
+            elif "429" in error_msg:
+                detail = "请求频率超限，请稍后重试。"
+            elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+                detail = "网络连接失败，请检查网络环境或 DashScope 服务状态。"
+            else:
+                detail = error_msg
+
+            QMessageBox.critical(self, "获取千问模型列表失败", f"错误详情：\n{detail}")
+
+        finally:
+            self.fetch_qwen_models_btn.setEnabled(True)
+            self.fetch_qwen_models_btn.setText("获取模型列表")
 
     def _on_provider_changed(self, text):
+        """根据选中的翻译提供商，联动显示/隐藏对应的设置组"""
         self.gemini_group.setVisible(text == "Gemini")
+        self.qwen_group.setVisible(text == "千问")
         self.xunfei_group.setVisible(text == "讯飞")
 
     def get_settings(self):
+        """
+        收集对话框中当前所有设置项，返回配置字典。
+        模型名称会剥离尾部的推荐/不推荐标注，只保留纯模型 ID。
+        """
+        # 从「模型名  ✅推荐」格式中提取纯模型名
+        gemini_model_raw = self.model_combo.currentText()
+        gemini_model = gemini_model_raw.split("  ")[0].strip()
+
+        qwen_model_raw = self.qwen_model_combo.currentText()
+        qwen_model = qwen_model_raw.split("  ")[0].strip()
+
+        # 映射显示文本到内部 provider 值
+        provider_map = {"Gemini": "gemini", "千问": "qwen", "讯飞": "xunfei"}
+        provider = provider_map.get(self.provider_combo.currentText(), "gemini")
+
         return {
-            "provider": "gemini" if self.provider_combo.currentText() == "Gemini" else "xunfei",
+            "provider": provider,
             "gemini_api_key": self.gemini_key_edit.text().strip(),
-            "gemini_model": self.model_combo.currentText(),
+            "gemini_model": gemini_model,
             "gemini_system_prompt": self.prompt_edit.toPlainText().strip(),
+            "qwen_api_key": self.qwen_key_edit.text().strip(),
+            "qwen_model": qwen_model,
+            "qwen_system_prompt": self.qwen_prompt_edit.toPlainText().strip(),
             "app_id": self.app_id_edit.text().strip(),
             "api_key": self.api_key_edit.text().strip(),
             "api_secret": self.api_secret_edit.text().strip(),
@@ -279,8 +559,14 @@ class MainWindow(QMainWindow):
             return
 
         provider = self.current_config.get("provider", "gemini")
+
+        # 根据选中的翻译提供商，校验必要的配置项
         if provider == "gemini" and not self.current_config.get("gemini_api_key"):
             QMessageBox.warning(self, "提示", '请先点击"API 设置"填写 Gemini API Key')
+            self.open_settings()
+            return
+        elif provider == "qwen" and not self.current_config.get("qwen_api_key"):
+            QMessageBox.warning(self, "提示", '请先点击"API 设置"填写千问 API Key')
             self.open_settings()
             return
         elif provider == "xunfei" and not all([
